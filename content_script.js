@@ -1,10 +1,10 @@
 // content_script.js
-// Este script se inyecta en CADA página que visitás (ver "matches" en manifest.json).
-// Su trabajo: buscar frases de riesgo en el texto visible y resaltarlas.
+// Con "all_frames": true en el manifest, este script se ejecuta una vez
+// POR CADA frame de la página (el documento principal + cada iframe).
+// Cada instancia es independiente y no sabe nada de las demás — por eso
+// reportamos nuestros resultados al background.js en vez de intentar
+// coordinarnos entre frames nosotros mismos.
 
-// --- Fase 3: motor de reglas (sin IA todavía) ---
-// Cada objeto tiene la frase a detectar y una "traducción" placeholder.
-// En la Fase 6 esto se va a reemplazar por la respuesta real del backend/NLP.
 const RISK_PHRASES = [
   { match: /compartir(\s\w+){0,3}\sterceros/gi, label: "Tus datos pueden pasar a otras empresas." },
   { match: /datos\sbiométricos/gi, label: "Piden datos de tu cuerpo (huellas, cara, voz)." },
@@ -17,14 +17,29 @@ const RISK_PHRASES = [
 ];
 
 /**
- * Recorre los nodos de texto del documento y envuelve las coincidencias
- * en un <mark class="cc-risk"> con un tooltip (title).
- * Usamos TreeWalker en vez de innerHTML para no romper el resto de la página.
+ * Busca recursivamente todos los shadowRoot dentro de un nodo raíz.
+ * Devuelve una lista de raíces para escanear: el nodo original + cada
+ * shadowRoot encontrado (incluyendo shadow roots anidados dentro de otros).
+ *
+ * Limitación conocida: solo detecta shadow roots en modo "open".
+ * Los de modo "closed" son intencionalmente inaccesibles desde JS externo,
+ * ni siquiera una extensión puede leerlos — es una limitación del navegador,
+ * no nuestra.
  */
+function collectShadowRoots(root, acc = [root]) {
+  const elements = root.querySelectorAll("*");
+  elements.forEach((el) => {
+    if (el.shadowRoot) {
+      acc.push(el.shadowRoot);
+      collectShadowRoots(el.shadowRoot, acc); // por si hay shadow DOM anidado
+    }
+  });
+  return acc;
+}
+
 function highlightRiskyText(root, matches) {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode: (node) => {
-      // Ignoramos texto dentro de <script>, <style> o que ya esté resaltado
       const parentTag = node.parentElement?.tagName;
       if (["SCRIPT", "STYLE", "MARK"].includes(parentTag)) {
         return NodeFilter.FILTER_REJECT;
@@ -37,7 +52,7 @@ function highlightRiskyText(root, matches) {
   let node;
   while ((node = walker.nextNode())) {
     for (const rule of RISK_PHRASES) {
-      rule.match.lastIndex = 0; // reset regex global state
+      rule.match.lastIndex = 0;
       if (rule.match.test(node.nodeValue)) {
         nodesToProcess.push(node);
         break;
@@ -49,10 +64,10 @@ function highlightRiskyText(root, matches) {
     let html = textNode.nodeValue;
     RISK_PHRASES.forEach((rule) => {
       rule.match.lastIndex = 0;
-      const found = html.match(rule.match); // ¿cuántas veces matcheó ESTA regla en ESTE nodo?
-      if (!found) return; // nada que hacer, no sumamos ni reemplazamos
+      const found = html.match(rule.match);
+      if (!found) return;
 
-      matches.push(...found.map(() => rule.label)); // una entrada por cada ocurrencia real
+      matches.push(...found.map(() => rule.label));
       rule.match.lastIndex = 0;
       html = html.replace(
         rule.match,
@@ -66,25 +81,30 @@ function highlightRiskyText(root, matches) {
   });
 }
 
-function scanPage() {
-  const foundLabels = [];
-  highlightRiskyText(document.body, foundLabels);
+// Acumulamos los matches de TODA la vida de este frame (no solo del último
+// scan), porque el MutationObserver puede disparar varios scans sucesivos
+// a medida que aparece contenido nuevo (por ejemplo, un banner de cookies
+// que carga con delay).
+let allMatches = [];
 
-  // Guardamos el resultado para que el popup lo pueda leer.
-  chrome.storage.local.set({
-    [window.location.href]: {
-      count: foundLabels.length,
-      labels: [...new Set(foundLabels)], // sin duplicados
-      scannedAt: Date.now(),
-    },
+function scanPage() {
+  const newMatches = [];
+  const roots = collectShadowRoots(document);
+  roots.forEach((root) => highlightRiskyText(root, newMatches));
+
+  if (newMatches.length > 0) {
+    allMatches.push(...newMatches);
+  }
+
+  chrome.runtime.sendMessage({
+    type: "SCAN_RESULT",
+    count: allMatches.length,
+    labels: allMatches,
   });
 }
 
-// Corremos el escaneo cuando la página termina de cargar.
 scanPage();
 
-// Bonus: si el popup de cookies aparece DESPUÉS (muy común), lo detectamos
-// observando cambios en el DOM y re-escaneando (con un pequeño debounce).
 let debounceTimer;
 const observer = new MutationObserver(() => {
   clearTimeout(debounceTimer);
