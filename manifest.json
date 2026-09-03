@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Read What You Sign",
+  "version": "0.1.0",
+  "description": "Resalta frases de riesgo en T&C y popups de cookies, y las explica en español coloquial.",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content_script.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
